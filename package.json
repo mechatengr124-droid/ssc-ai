@@ -1,0 +1,15 @@
+{
+  "name": "ssc-ai",
+  "version": "2.0.0",
+  "description": "SSC AI - Full-stack deployed on Vercel",
+  "main": "api/gemini.js",
+  "scripts": {
+    "start": "node api/gemini.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
