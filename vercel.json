@@ -1,10 +1,4 @@
 {
-  "functions": {
-    "api/gemini.js": {
-      "maxDuration": 30,
-      "memory": 1024
-    }
-  },
   "headers": [
     {
       "source": "/api/(.*)",
