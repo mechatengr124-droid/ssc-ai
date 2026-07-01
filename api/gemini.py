@@ -41,15 +41,16 @@ ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('ALLOWED_ORIGINS', '*').spl
 SEARCH_API_KEY = os.environ.get('SEARCH_API_KEY', '')
 SEARCH_ENGINE_ID = os.environ.get('SEARCH_ENGINE_ID', '')
 
-# ── Web Search ──────────────────────────────────────────────────
+# ── Web Search (synchronous) ─────────────────────────────────
 
-async def perform_web_search(query: str) -> Optional[str]:
+def perform_web_search(query: str) -> Optional[str]:
+    """Synchronous web search using Google Custom Search API."""
     if not SEARCH_API_KEY or not SEARCH_ENGINE_ID:
         return None
     url = f"https://www.googleapis.com/customsearch/v1?key={SEARCH_API_KEY}&cx={SEARCH_ENGINE_ID}&q={query}&num=5"
-    async with httpx.AsyncClient(timeout=8.0) as client:
+    with httpx.Client(timeout=8.0) as client:
         try:
-            resp = await client.get(url)
+            resp = client.get(url)
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -88,12 +89,10 @@ async def generate_with_sdk(contents: List[Dict], model: str, config: Dict, api_
             'top_k': config.get('top_k', 40),
         }
     )
-    # Use synchronous SDK – we'll wrap in a thread if needed, but it's fine.
     response = gen_model.generate_content(
         contents=contents,
         stream=True,
     )
-    # Return an async generator that yields chunks
     for chunk in response:
         if chunk.text:
             yield chunk.text
@@ -148,9 +147,8 @@ async def generate_hybrid(contents: List[Dict], model: str, config: Dict,
                           mastermind_enabled: bool = False):
     """
     Try SDK first (if enabled), then fallback to direct fetch.
-    Yields text chunks and also sends search status as an event (we'll include in SSE).
+    Yields text chunks.
     """
-    # Determine method order
     if USE_FETCH_FIRST:
         methods = ['fetch', 'sdk']
     elif USE_SDK_FIRST:
@@ -161,22 +159,18 @@ async def generate_hybrid(contents: List[Dict], model: str, config: Dict,
     models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_error = None
 
-    # If web search is enabled, we already injected it before calling this function.
-
     for current_model in models_to_try:
         for method in methods:
-            # Try all keys
             for idx, api_key in enumerate(ALL_KEYS):
                 if not api_key:
                     continue
                 try:
                     print(f"🔄 Trying {method} on {current_model} with key {idx+1}/{len(ALL_KEYS)}")
                     if method == 'sdk':
-                        # Generate stream from SDK
                         async for chunk in generate_with_sdk(contents, current_model, config, api_key):
                             yield chunk
                         print(f"✅ SDK success on {current_model}")
-                        return  # Success
+                        return
                     else:  # fetch
                         async for chunk in generate_with_fetch(contents, current_model, config, api_key):
                             yield chunk
@@ -195,8 +189,7 @@ async def generate_hybrid(contents: List[Dict], model: str, config: Dict,
                             raise  # rethrow fatal errors
 
     # If we got here, all methods failed
-    error_msg = f"All methods failed. Last error: {last_error}"
-    raise Exception(error_msg)
+    raise Exception(f"All methods failed. Last error: {last_error}")
 
 # ── Health Check ──────────────────────────────────────────────
 
@@ -213,11 +206,10 @@ def health_check():
         },
         'methods': {}
     }
-    # Test SDK (if primary key exists)
     if ALL_KEYS:
         try:
             genai.configure(api_key=ALL_KEYS[0])
-            genai.list_models()  # lightweight call
+            genai.list_models()
             result['methods']['sdk'] = {'status': 'healthy', 'tested': True}
         except Exception as e:
             result['methods']['sdk'] = {'status': 'unhealthy', 'error': str(e)}
@@ -225,7 +217,6 @@ def health_check():
     else:
         result['methods']['sdk'] = {'status': 'no_key', 'tested': False}
 
-    # Test fetch (direct call to list models)
     try:
         resp = httpx.get(
             'https://generativelanguage.googleapis.com/v1/models',
@@ -249,15 +240,12 @@ def health_check():
 
 @app.route('/api/gemini', methods=['GET', 'POST', 'OPTIONS'])
 def handler():
-    # CORS preflight
     if request.method == 'OPTIONS':
         return '', 200
 
-    # GET = Health check
     if request.method == 'GET':
         return jsonify(health_check())
 
-    # POST = Generation
     if request.method == 'POST':
         data = request.get_json()
         if not data:
@@ -276,7 +264,6 @@ def handler():
         if not ALL_KEYS:
             return jsonify({'error': 'No API keys configured'}), 500
 
-        # ── Extract parameters ─────────────────────────────────
         model = data.get('model', 'gemini-2.5-flash')
         temperature = data.get('temperature', 0.8)
         max_tokens = data.get('maxTokens', 2048)
@@ -286,39 +273,34 @@ def handler():
         # ── Real-time clock injection ──────────────────────────
         now = datetime.utcnow()
         utc_str = now.strftime('%a, %d %b %Y %H:%M:%S GMT')
-        wat_str = now.replace(tzinfo=None).astimezone().strftime('%A, %B %d, %Y %I:%M:%S %p')  # simplified
+        wat_str = now.replace(tzinfo=None).astimezone().strftime('%A, %B %d, %Y %I:%M:%S %p')
         live_context = f"[LIVE SYSTEM CLOCK - injected by server]\nUTC: {utc_str}\nWest Africa Time (WAT, UTC+1, Nigeria): {wat_str}\nYou MUST use this timestamp to answer any question about current time or date.\nNEVER claim you cannot access real-time time data."
 
-        # Inject into first user message
         if contents and contents[0].get('role') == 'user':
             contents[0]['parts'][0]['text'] += '\n\n' + live_context
 
-        # ── Web Search ──────────────────────────────────────────
+        # ── Web Search (synchronous) ──────────────────────────
         search_status = None
         if web_search:
-            # Get last user message (skip potential system prompt)
             user_msgs = [m for m in contents if m['role'] == 'user']
             if user_msgs:
                 last_user = user_msgs[-1]
                 query = last_user['parts'][0]['text']
-                # Clean query
                 query = query.replace('📄 File:', '').split('---')[0].strip()
                 query = query.split('\n')[0] if '\n' in query else query
                 query = query[:200]
                 if query:
-                    search_results = await perform_web_search(query)
+                    search_results = perform_web_search(query)   # synchronous call
                     if search_results:
-                        # Inject search results before the last user message
                         search_inject = {
                             'role': 'user',
                             'parts': [{'text': f"[LIVE WEB SEARCH - {utc_str}]\nQuery: \"{query[:150]}\"\n\n{search_results}\n\n[END SEARCH RESULTS]\nUse these fresh results for your answer. Cite sources."}]
                         }
-                        # Find the last user message index and insert before it
                         last_user_idx = max(i for i, m in enumerate(contents) if m['role'] == 'user')
                         contents.insert(last_user_idx, search_inject)
                         search_status = {'succeeded': True, 'query': query[:150], 'resultCount': len(search_results.split('\n\n'))}
                     else:
-                        # Fallback note
+                        last_user_idx = max(i for i, m in enumerate(contents) if m['role'] == 'user')
                         contents.insert(last_user_idx, {
                             'role': 'user',
                             'parts': [{'text': '[NOTE] Live web search API is not configured. Use the system clock for time questions.'}]
@@ -351,49 +333,32 @@ Focus on QUALITY over length."""}]
 
         # ── Generate streaming response ──────────────────────
         def generate():
-            # Send search status first (if any)
             if search_status:
                 yield f"data: {json.dumps({'searchStatus': search_status})}\n\n"
 
             full_text = ''
             try:
-                # Run hybrid generator
-                async def async_generator():
-                    async for chunk in generate_hybrid(contents, model, config, web_search, mastermind):
-                        yield chunk
-                # Use asyncio to run the async generator in Flask's sync context
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                async_gen = async_generator()
+                async_gen = generate_hybrid(contents, model, config, web_search, mastermind)
                 while True:
                     try:
                         chunk = loop.run_until_complete(async_gen.__anext__())
                         full_text += chunk
-                        # Send incremental text
                         payload = {'candidates': [{'content': {'parts': [{'text': full_text}]}}]}
                         yield f"data: {json.dumps(payload)}\n\n"
                     except StopAsyncIteration:
                         break
                     except Exception as e:
-                        # Send error
                         error_payload = {'error': str(e)}
                         yield f"data: {json.dumps(error_payload)}\n\n"
                         break
-                # Final usage metadata (simulate – we don't have token counts from SDK)
-                # We could add a mock token count, but not necessary.
-                # yield f"data: {json.dumps({'usageMetadata': {'totalTokenCount': len(full_text)//4}})}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
-                error_msg = f"Backend error: {str(e)}"
-                yield f"data: {json.dumps({'error': error_msg})}\n\n"
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
                 yield "data: [DONE]\n\n"
 
         return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
-# ── Vercel expects `app` as the WSGI application ─────────────
-
-# We'll keep the app as is.
-
-# ── For local testing ──────────────────────────────────────────
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+# ── Vercel entry point ────────────────────────────────────────
+# Vercel looks for `app` (Flask instance)
