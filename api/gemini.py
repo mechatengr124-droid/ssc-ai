@@ -92,7 +92,7 @@ def generate_with_sdk(contents: List[Dict], model: str, config: Dict, api_key: s
         if chunk.text:
             yield chunk.text
 
-# ── Direct Fetch Generation (fixed streaming) ────────────────
+# ── Direct Fetch Generation (FIXED streaming) ────────────────
 
 def generate_with_fetch(contents: List[Dict], model: str, config: Dict, api_key: str):
     """Direct REST API call (fallback) with synchronous streaming."""
@@ -108,18 +108,18 @@ def generate_with_fetch(contents: List[Dict], model: str, config: Dict, api_key:
         }
     }
 
-    # Use httpx.stream directly with proper context
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
         with client.stream('POST', url, headers=headers, json=payload) as response:
             if response.status_code != 200:
+                # Read the full error body before raising
+                error_body = response.read()
                 try:
-                    error_data = response.json()
+                    error_data = json.loads(error_body)
                     error_msg = error_data.get('error', {}).get('message', str(response.status_code))
                 except:
-                    error_msg = response.text
+                    error_msg = error_body.decode()
                 raise Exception(f"HTTP {response.status_code}: {error_msg}")
 
-            # Read the streaming response correctly
             buffer = ''
             for chunk in response.iter_bytes():
                 buffer += chunk.decode()
@@ -250,14 +250,13 @@ def handler():
         if not contents or not isinstance(contents, list) or len(contents) == 0:
             return jsonify({'error': 'Missing or invalid "contents"'}), 400
 
-        # Validate and clean contents – remove any unknown fields like 'searchUsed'
+        # Clean contents – remove any extra fields
         cleaned_contents = []
         for msg in contents:
             if not msg.get('role') or not msg.get('parts') or not isinstance(msg['parts'], list) or len(msg['parts']) == 0:
                 return jsonify({'error': 'Each message must have "role" and non-empty "parts"'}), 400
             if not msg['parts'][0].get('text'):
                 return jsonify({'error': 'Each part must have "text" property'}), 400
-            # Only keep 'role' and 'parts' – remove any extra fields
             cleaned_contents.append({
                 'role': msg['role'],
                 'parts': msg['parts']
