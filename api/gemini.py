@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import asyncio
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -34,9 +33,6 @@ FALLBACK_MODELS = [
 # Timeout
 REQUEST_TIMEOUT = int(os.environ.get('REQUEST_TIMEOUT_MS', 30000)) / 1000.0
 
-# CORS
-ALLOWED_ORIGINS = [o.strip() for o in os.environ.get('ALLOWED_ORIGINS', '*').split(',')]
-
 # Web Search
 SEARCH_API_KEY = os.environ.get('SEARCH_API_KEY', '')
 SEARCH_ENGINE_ID = os.environ.get('SEARCH_ENGINE_ID', '')
@@ -44,7 +40,6 @@ SEARCH_ENGINE_ID = os.environ.get('SEARCH_ENGINE_ID', '')
 # ── Web Search (synchronous) ─────────────────────────────────
 
 def perform_web_search(query: str) -> Optional[str]:
-    """Synchronous web search using Google Custom Search API."""
     if not SEARCH_API_KEY or not SEARCH_ENGINE_ID:
         return None
     url = f"https://www.googleapis.com/customsearch/v1?key={SEARCH_API_KEY}&cx={SEARCH_ENGINE_ID}&q={query}&num=5"
@@ -75,10 +70,10 @@ def is_network_error(error: Exception) -> bool:
     msg = str(error).lower()
     return any(k in msg for k in ['timeout', 'connection', 'econnrefused', 'econnreset', 'socket', 'dns'])
 
-# ── SDK Generation ─────────────────────────────────────────────
+# ── SDK Generation (synchronous streaming) ────────────────────
 
-async def generate_with_sdk(contents: List[Dict], model: str, config: Dict, api_key: str):
-    """Streaming generation using the official SDK."""
+def generate_with_sdk(contents: List[Dict], model: str, config: Dict, api_key: str):
+    """Streaming generation using the official SDK (synchronous)."""
     genai.configure(api_key=api_key)
     gen_model = genai.GenerativeModel(
         model_name=model,
@@ -97,10 +92,10 @@ async def generate_with_sdk(contents: List[Dict], model: str, config: Dict, api_
         if chunk.text:
             yield chunk.text
 
-# ── Direct Fetch Generation ────────────────────────────────────
+# ── Direct Fetch Generation (synchronous streaming) ───────────
 
-async def generate_with_fetch(contents: List[Dict], model: str, config: Dict, api_key: str):
-    """Direct REST API call (fallback)."""
+def generate_with_fetch(contents: List[Dict], model: str, config: Dict, api_key: str):
+    """Direct REST API call (fallback) with synchronous streaming."""
     url = f"https://generativelanguage.googleapis.com/v1/models/{model}:streamGenerateContent?alt=sse"
     headers = {'x-goog-api-key': api_key, 'Content-Type': 'application/json'}
     payload = {
@@ -112,18 +107,17 @@ async def generate_with_fetch(contents: List[Dict], model: str, config: Dict, ap
             'topK': config.get('top_k', 40),
         }
     }
-    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-        async with client.stream('POST', url, headers=headers, json=payload) as response:
+    with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+        with client.stream('POST', url, headers=headers, json=payload) as response:
             if response.status_code != 200:
-                error_text = await response.aread()
                 try:
-                    error_data = json.loads(error_text)
+                    error_data = response.json()
                     error_msg = error_data.get('error', {}).get('message', str(response.status_code))
                 except:
-                    error_msg = error_text.decode()
+                    error_msg = response.text
                 raise Exception(f"HTTP {response.status_code}: {error_msg}")
             buffer = ''
-            async for chunk in response.aiter_bytes():
+            for chunk in response.iter_bytes():
                 buffer += chunk.decode()
                 lines = buffer.split('\n')
                 buffer = lines.pop() if lines else ''
@@ -142,12 +136,10 @@ async def generate_with_fetch(contents: List[Dict], model: str, config: Dict, ap
 
 # ── Hybrid Generator ──────────────────────────────────────────
 
-async def generate_hybrid(contents: List[Dict], model: str, config: Dict,
-                          web_search_enabled: bool = False,
-                          mastermind_enabled: bool = False):
+def generate_hybrid(contents: List[Dict], model: str, config: Dict):
     """
     Try SDK first (if enabled), then fallback to direct fetch.
-    Yields text chunks.
+    Yields text chunks synchronously.
     """
     if USE_FETCH_FIRST:
         methods = ['fetch', 'sdk']
@@ -167,12 +159,12 @@ async def generate_hybrid(contents: List[Dict], model: str, config: Dict,
                 try:
                     print(f"🔄 Trying {method} on {current_model} with key {idx+1}/{len(ALL_KEYS)}")
                     if method == 'sdk':
-                        async for chunk in generate_with_sdk(contents, current_model, config, api_key):
+                        for chunk in generate_with_sdk(contents, current_model, config, api_key):
                             yield chunk
                         print(f"✅ SDK success on {current_model}")
                         return
                     else:  # fetch
-                        async for chunk in generate_with_fetch(contents, current_model, config, api_key):
+                        for chunk in generate_with_fetch(contents, current_model, config, api_key):
                             yield chunk
                         print(f"✅ Fetch success on {current_model}")
                         return
@@ -180,15 +172,14 @@ async def generate_hybrid(contents: List[Dict], model: str, config: Dict,
                     print(f"⚠️ {method} failed: {e}")
                     last_error = e
                     if is_quota_error(e) or is_network_error(e):
-                        continue  # try next key
+                        continue
                     else:
                         if method == 'sdk' and SDK_FALLBACK:
                             print("🔄 Non-quota SDK error, falling back to fetch")
-                            break  # break out of key loop to try fetch
+                            break
                         else:
-                            raise  # rethrow fatal errors
+                            raise
 
-    # If we got here, all methods failed
     raise Exception(f"All methods failed. Last error: {last_error}")
 
 # ── Health Check ──────────────────────────────────────────────
@@ -279,7 +270,7 @@ def handler():
         if contents and contents[0].get('role') == 'user':
             contents[0]['parts'][0]['text'] += '\n\n' + live_context
 
-        # ── Web Search (synchronous) ──────────────────────────
+        # ── Web Search ──────────────────────────────────────────
         search_status = None
         if web_search:
             user_msgs = [m for m in contents if m['role'] == 'user']
@@ -290,7 +281,7 @@ def handler():
                 query = query.split('\n')[0] if '\n' in query else query
                 query = query[:200]
                 if query:
-                    search_results = perform_web_search(query)   # synchronous call
+                    search_results = perform_web_search(query)
                     if search_results:
                         search_inject = {
                             'role': 'user',
@@ -338,24 +329,14 @@ Focus on QUALITY over length."""}]
 
             full_text = ''
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                async_gen = generate_hybrid(contents, model, config, web_search, mastermind)
-                while True:
-                    try:
-                        chunk = loop.run_until_complete(async_gen.__anext__())
-                        full_text += chunk
-                        payload = {'candidates': [{'content': {'parts': [{'text': full_text}]}}]}
-                        yield f"data: {json.dumps(payload)}\n\n"
-                    except StopAsyncIteration:
-                        break
-                    except Exception as e:
-                        error_payload = {'error': str(e)}
-                        yield f"data: {json.dumps(error_payload)}\n\n"
-                        break
+                for chunk in generate_hybrid(contents, model, config):
+                    full_text += chunk
+                    payload = {'candidates': [{'content': {'parts': [{'text': full_text}]}}]}
+                    yield f"data: {json.dumps(payload)}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                error_msg = str(e)
+                yield f"data: {json.dumps({'error': error_msg})}\n\n"
                 yield "data: [DONE]\n\n"
 
         return Response(stream_with_context(generate()), mimetype='text/event-stream')
